@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Read Aloud</title>
+<link rel="icon" href="icon.png">
+<style>
+  :root { --bg:#fbfaf7; --fg:#22211f; --muted:#7a776f; --line:#e6e2d9; --hi:#fff1c2; --accent:#c4552d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1d1c1a; --fg:#ece9e2; --muted:#9a968c; --line:#34322e; --hi:#4a3f1c; --accent:#e07a50; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:17px/1.6 system-ui, "Segoe UI", "Yu Gothic UI", sans-serif; }
+  header { position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--line); padding:10px 16px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  button { font:inherit; border:1px solid var(--line); background:transparent; color:var(--fg); border-radius:8px; padding:4px 12px; cursor:pointer; }
+  #play { background:var(--accent); border-color:var(--accent); color:#fff; min-width:84px; }
+  select { font:inherit; font-size:14px; max-width:260px; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:3px 6px; }
+  label { font-size:14px; color:var(--muted); display:flex; gap:6px; align-items:center; }
+  #status { font-size:13px; color:var(--muted); margin-left:auto; }
+  main { max-width:720px; margin:0 auto; padding:16px; }
+  main p { margin:0 0 .7em; padding:2px 6px; border-radius:6px; cursor:pointer; white-space:pre-wrap; }
+  main p.now { background:var(--hi); }
+  .empty { color:var(--muted); text-align:center; margin-top:20vh; cursor:default; }
+</style>
+</head>
+<body>
+<header>
+  <button id="play">▶ Play</button>
+  <button id="stop" title="Esc">■</button>
+  <label>Speed <input id="rate" type="range" min="0.7" max="2" step="0.05"><span id="rateVal"></span></label>
+  <select id="voice"></select>
+  <span id="status"></span>
+</header>
+<main id="text"><p class="empty">Copy some text and press Ctrl+Alt+R, or paste here with Ctrl+V.</p></main>
+
+<script>
+const $ = id => document.getElementById(id);
+const synth = speechSynthesis;
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+let chunks = [], idx = 0, playing = false, voices = [];
+
+// Turn Markdown-style chat text into sentences that sound natural when read aloud.
+function clean(src) {
+  return src
+    .replace(/\r/g, '')
+    .replace(/```[\s\S]*?```/g, m => m.split('\n').length > 6 ? '\n(code block skipped)\n' : m.replace(/```\w*/g, ''))
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/https?:\/\/[^\s)]+/g, m => m.replace(/^https?:\/\/(www\.)?/, '').split('/')[0])
+    .replace(/(?:[A-Za-z]:)?[\w.\-\[\]@]*(?:[\\/][\w.\-\[\]@]+){2,}/g, m => m.split(/[\\/]/).pop())
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^#{1,6}\s*/gm, '')
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/^\s*\|?[-:| ]+\|?\s*$/gm, '')
+    .replace(/\s*\|\s*/g, ', ')
+    .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+    .replace(/(^|\W)\*(?=\S)([^*\n]+?)\*(?=\W|$)/g, '$1$2')
+    .replace(/[→⇒]/g, ', then ')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+function split(text) {
+  const out = [];
+  for (const para of text.split(/\n+/).map(s => s.trim()).filter(Boolean)) {
+    if (para.length <= 320) { out.push(para); continue; }
+    let cur = '';
+    for (const s of para.match(/[^.!?。！？]+[.!?。！？]*\s*/g) || [para]) {
+      if ((cur + s).length > 320 && cur) { out.push(cur.trim()); cur = ''; }
+      cur += s;
+    }
+    if (cur.trim()) out.push(cur.trim());
+  }
+  return out;
+}
+
+function load(raw) {
+  stop();
+  chunks = split(clean(raw || ''));
+  idx = 0;
+  const main = $('text');
+  main.innerHTML = '';
+  if (!chunks.length) {
+    main.innerHTML = '<p class="empty">Clipboard was empty. Paste text here with Ctrl+V.</p>';
+    return;
+  }
+  chunks.forEach((c, i) => {
+    const p = document.createElement('p');
+    p.textContent = c;
+    p.onclick = () => { idx = i; start(); };
+    main.appendChild(p);
+  });
+  pickDefaultVoice();
+}
+
+function isJapanese(s) {
+  const ja = (s.match(/[぀-ヿ一-鿿]/g) || []).length;
+  return ja / Math.max(1, s.replace(/\s/g, '').length) > 0.3;
+}
+
+function rank(v, ja) {
+  let score = 0;
+  if (/Natural/i.test(v.name)) score += 100;
+  if (/Multilingual/i.test(v.name)) score += 20;
+  if (ja ? v.lang.startsWith('ja') : v.lang === 'en-US') score += 50;
+  else if (!ja && v.lang.startsWith('en')) score += 30;
+  if (/Ava|Andrew|Emma|Brian|Nanami/.test(v.name)) score += 10;
+  return score;
+}
+
+function fillVoices() {
+  voices = synth.getVoices().filter(v => /^(en|ja)/.test(v.lang))
+    .sort((a, b) => a.lang.localeCompare(b.lang) || a.name.localeCompare(b.name));
+  const sel = $('voice');
+  sel.innerHTML = '';
+  for (const v of voices) sel.add(new Option(v.name.replace(/^Microsoft /, '').replace(/ - .*$/, ''), v.name));
+  pickDefaultVoice();
+}
+
+function pickDefaultVoice() {
+  if (!voices.length) return;
+  const ja = isJapanese(chunks.join(' '));
+  const saved = store.get(ja ? 'voice-ja' : 'voice-en');
+  const best = voices.find(v => v.name === saved) || [...voices].sort((a, b) => rank(b, ja) - rank(a, ja))[0];
+  $('voice').value = best.name;
+}
+
+function speakCurrent() {
+  if (!playing || idx >= chunks.length) { stop(); if (idx >= chunks.length) idx = 0; return; }
+  document.querySelectorAll('main p').forEach((p, i) => p.classList.toggle('now', i === idx));
+  document.querySelector('main p.now')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  const u = new SpeechSynthesisUtterance(chunks[idx]);
+  const v = voices.find(v => v.name === $('voice').value);
+  if (v) { u.voice = v; u.lang = v.lang; }
+  u.rate = +$('rate').value;
+  const mine = u;
+  u.onend = () => { if (playing && current === mine) { idx++; speakCurrent(); } };
+  u.onerror = e => {
+    if (e.error === 'interrupted' || e.error === 'canceled') return;
+    playing = false; render();
+    $('status').textContent = e.error === 'not-allowed' ? 'Press Space to start' : 'Speech error: ' + e.error;
+  };
+  current = u;
+  synth.speak(u);
+  $('status').textContent = `${idx + 1} / ${chunks.length}`;
+}
+let current = null;
+
+function start() {
+  if (!chunks.length) return;
+  synth.cancel();
+  playing = true; render();
+  speakCurrent();
+}
+function stop() {
+  playing = false; current = null;
+  synth.cancel(); render();
+}
+function render() {
+  $('play').textContent = playing ? '❚❚ Pause' : '▶ Play';
+  document.title = (playing ? '🔊 ' : '') + 'Read Aloud';
+}
+
+$('play').onclick = () => playing ? stop() : start();
+$('stop').onclick = () => { stop(); idx = 0; document.querySelectorAll('main p').forEach(p => p.classList.remove('now')); };
+$('voice').onchange = () => {
+  store.set(isJapanese(chunks.join(' ')) ? 'voice-ja' : 'voice-en', $('voice').value);
+  if (playing) start();
+};
+$('rate').value = store.get('rate') || '1.1';
+$('rateVal').textContent = (+$('rate').value).toFixed(2) + '×';
+$('rate').oninput = () => { $('rateVal').textContent = (+$('rate').value).toFixed(2) + '×'; store.set('rate', $('rate').value); };
+$('rate').onchange = () => { if (playing) start(); };
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space') { e.preventDefault(); playing ? stop() : start(); }
+  if (e.code === 'Escape') $('stop').click();
+  if (e.code === 'ArrowRight') { idx = Math.min(idx + 1, chunks.length - 1); if (playing) start(); }
+  if (e.code === 'ArrowLeft')  { idx = Math.max(idx - 1, 0); if (playing) start(); }
+});
+document.addEventListener('paste', e => { load(e.clipboardData.getData('text')); start(); });
+
+synth.onvoiceschanged = fillVoices;
+fillVoices();
+
+// Load the clipboard text that read.ps1 wrote, and start playing once the voices are ready.
+const s = document.createElement('script');
+s.src = 'text.js?t=' + Date.now();
+s.onload = () => {
+  load(window.READ_TEXT);
+  let tries = 0;
+  const go = () => (voices.length || ++tries > 20) ? start() : setTimeout(go, 150);
+  go();
+};
+document.head.appendChild(s);
+</script>
+</body>
+</html>
